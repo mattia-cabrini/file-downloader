@@ -14,22 +14,27 @@ import (
 
 var filePath string
 var threads int
+var dir string
 
 type ListFile struct {
 	fp     *os.File
 	k      *bufio.Scanner
 	closed bool
+	lineNo int
+
+	dir string
 
 	lock *sync.Mutex
 }
 
-func InitListFile(filePath string) (l ListFile, err error) {
+func InitListFile(filePath string, dir string) (l ListFile, err error) {
 	l.fp, err = os.OpenFile(filePath, os.O_RDONLY, 0400)
 
 	if err == nil {
 		l.k = bufio.NewScanner(l.fp)
 		l.lock = &sync.Mutex{}
 		l.closed = false
+		l.dir = dir
 	} else {
 		l.closed = true
 	}
@@ -37,94 +42,127 @@ func InitListFile(filePath string) (l ListFile, err error) {
 	return
 }
 
-func (l *ListFile) ReadLine() (_ string, err error) {
-	l.lock.Lock()
-	defer l.lock.Unlock()
+func (f *ListFile) ReadLine() (_ string, _ int, err error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
 
-	if l.closed {
-		return "", io.EOF
+	if f.closed {
+		return "", -1, io.EOF
 	}
 
-	if l.k.Scan() {
-		return l.k.Text(), nil
+	f.lineNo++
+
+	if f.k.Scan() {
+		return f.k.Text(), f.lineNo, nil
 	}
 
-	_ = l.fp.Close()
-	l.closed = true
+	_ = f.fp.Close()
+	f.closed = true
 
-	if err = l.k.Err(); err != nil {
-		log.Printf("%v", l.k.Err())
+	if err = f.k.Err(); err != nil {
+		log.Printf("%v", f.k.Err())
 	} else {
 		err = io.EOF
 	}
 
-	return "", err
+	return "", f.lineNo, err
 }
 
-func downloadDocument(url string, fname string) {
-	log.Printf("Downloading `%s' into `%s'", url, fname)
+func (f *ListFile) downloadDocument(url string, fname string, lineNo int) {
+	f.Log(os.Stdout, lineNo, "Downloading `%s' into `%s'\n", url, fname)
 	resp, err := http.Get(url)
 
 	if err != nil {
-		log.Printf("An error occurred while trying to download `%s': %v", url, err)
+		f.Log(os.Stderr, lineNo, "An error occurred while trying to download `%s': %v\n", url, err)
 		return
 	}
 
 	defer deferrable(resp.Body.Close, url)()
 
-	f, err := os.OpenFile(fname, os.O_WRONLY, 0600)
+	fp, err := os.OpenFile(fname, os.O_WRONLY, 0600)
 	if err != nil {
-		log.Printf("Could not open file `%s': %v", fname, err)
+		f.Log(os.Stderr, lineNo, "Could not open file `%s': %v\n", fname, err)
 		return
 	}
 
-	defer deferrable(f.Close, url)()
+	defer deferrable(fp.Close, url)()
 
-	_, err = io.Copy(f, resp.Body)
+	_, err = io.Copy(fp, resp.Body)
 
-	log.Printf("Download complete for `%s' into `%s'", url, fname)
+	f.Log(os.Stdout, lineNo, "Download complete for `%s' into `%s'\n", url, fname)
 }
 
 func deferrable(f func() error, url string) func() {
 	return func() {
 		if err := f(); err != nil {
-			log.Printf("An error occurred (`%s'): %v", url, err)
+			_, _ = fmt.Fprintf(os.Stderr, "An error occurred (`%s'): %v", url, err)
 		}
 	}
 }
 
-func download(wg *sync.WaitGroup, f *ListFile) {
+func (f *ListFile) download(wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	for url, err := f.ReadLine(); err == nil; url, err = f.ReadLine() {
-		fname := filenameFromURL(url)
+	url, lineNo, err := f.ReadLine()
+	for err == nil {
+		fname := filenameFromURL(f.dir, url)
 
 		if fname != "" {
-			downloadDocument(url, fname)
+			f.downloadDocument(url, fname, lineNo)
+		} else {
+			f.Log(os.Stderr, lineNo, "Could not download `%s': it was impossible to secure a file\n", url)
 		}
+
+		url, lineNo, err = f.ReadLine()
 	}
 }
 
-func filenameFromURL(url string) string {
-	urlSplit := strings.Split(url, "/")
-	filename := urlSplit[len(urlSplit)-1]
-	actualFilename := filename
+func (f *ListFile) Log(fp *os.File, line int, format string, args ...interface{}) {
+	format = fmt.Sprintf("[#%d] %s", line, format)
+	_, _ = fmt.Fprintf(fp, format, args...)
+}
 
-	_, err := os.Stat(actualFilename)
-	for i := 1; err == nil; i++ {
+var filenameFromURL = func() func(dir, url string) string {
+	var m = &sync.Mutex{}
+
+	return func (dir, url string) string {
+		m.Lock()
+		defer m.Unlock()
+
+		urlSplit := strings.Split(url, "/")
+		filename := dir + "/" + urlSplit[len(urlSplit)-1]
+		actualFilename := filename
+
+		_, err := os.Stat(actualFilename)
+		for i := 1; err == nil; i++ {
 		actualFilename = fmt.Sprintf("%s (%d)", filename, i)
 		_, err = os.Stat(actualFilename)
 	}
 
-	f, err := os.Create(actualFilename)
-	if err != nil {
+		f, err := os.Create(actualFilename)
+		if err != nil {
 		log.Printf("Could not create file `%s': %v", actualFilename, err)
 		return ""
 	}
 
-	_ = f.Close()
+		_ = f.Close()
 
-	return actualFilename
+		return actualFilename
+	}
+}()
+
+func secureDir(dir string) error {
+	fi, err := os.Stat(dir)
+
+	if err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("`%s' is not a directory", dir)
+		}
+
+		return nil
+	}
+
+	return os.Mkdir(dir, 0770)
 }
 
 func main() {
@@ -132,19 +170,24 @@ func main() {
 
 	flag.StringVar(&filePath, "file", "list.txt", "the path to the file that contains a list of links to resources to download")
 	flag.IntVar(&threads, "threads", 1, "number oh concurrent downloads")
+	flag.StringVar(&dir, "dir", ".", "the directory that files will be downloaded in")
 	flag.Parse()
 
 	fmt.Printf("Downloading file list: %s\nConcurrent downloads %d\n", filePath, threads)
 
-	f, err := InitListFile(filePath)
+	f, err := InitListFile(filePath, dir)
+	if err != nil {
+		log.Fatal(err)
+	}
 
+	err = secureDir(dir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
-		go download(wg, &f)
+		go f.download(wg)
 	}
 
 	wg.Wait()
